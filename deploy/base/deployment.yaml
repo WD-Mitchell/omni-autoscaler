@@ -24,7 +24,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: controller
-          image: ghcr.io/wd-mitchell/omni-autoscaler:latest
+          image: ghcr.io/wd-mitchell/omni-autoscaler:main
           imagePullPolicy: Always
           args:
             - -config=/etc/omni-autoscaler/config.yaml
