@@ -49,6 +49,9 @@ type Config struct {
 	Cooldowns CooldownConfig `json:"cooldowns"`
 	// SyncInterval is how often to check for scaling needs
 	SyncInterval Duration `json:"syncInterval"`
+	// IgnoredNamespaces lists namespaces to ignore when counting pending pods
+	// This prevents feedback loops from system pods on new nodes
+	IgnoredNamespaces []string `json:"ignoredNamespaces"`
 }
 
 // MachineSetConfig defines scaling parameters for a single machine set
@@ -94,6 +97,14 @@ func LoadFromFile(path string) (*Config, error) {
 	}
 	if cfg.Cooldowns.ScaleDown == 0 {
 		cfg.Cooldowns.ScaleDown = Duration(10 * time.Minute)
+	}
+	if len(cfg.IgnoredNamespaces) == 0 {
+		cfg.IgnoredNamespaces = []string{
+			"kube-system",
+			"kube-public",
+			"kube-node-lease",
+			"flux-system",
+		}
 	}
 
 	return &cfg, nil

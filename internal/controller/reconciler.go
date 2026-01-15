@@ -169,7 +169,14 @@ func (a *Autoscaler) reconcileMachineSet(ctx context.Context, msConfig config.Ma
 }
 
 // getPendingPods returns pods that are pending due to insufficient resources
+// Filters out ignored namespaces to avoid feedback loop from new node system pods
 func (a *Autoscaler) getPendingPods(ctx context.Context) ([]corev1.Pod, error) {
+	// Build ignored namespaces map from config
+	ignoredNamespaces := make(map[string]bool)
+	for _, ns := range a.config.IgnoredNamespaces {
+		ignoredNamespaces[ns] = true
+	}
+
 	pods, err := a.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		FieldSelector: "status.phase=Pending",
 	})
@@ -179,6 +186,11 @@ func (a *Autoscaler) getPendingPods(ctx context.Context) ([]corev1.Pod, error) {
 
 	var pendingPods []corev1.Pod
 	for _, pod := range pods.Items {
+		// Skip ignored namespaces
+		if ignoredNamespaces[pod.Namespace] {
+			continue
+		}
+
 		// Check if pod is unschedulable due to resources
 		for _, condition := range pod.Status.Conditions {
 			if condition.Type == corev1.PodScheduled && condition.Status == corev1.ConditionFalse {
