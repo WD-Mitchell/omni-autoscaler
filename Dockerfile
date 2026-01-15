@@ -23,6 +23,6 @@ WORKDIR /
 
 COPY --from=builder /omni-autoscaler /omni-autoscaler
 
-USER nonroot:nonroot
+USER 65532:65532
 
 ENTRYPOINT ["/omni-autoscaler"]
