@@ -67,9 +67,17 @@ func (c *Client) GetMachineSetStatus(ctx context.Context, machineSetName string)
 
 	spec := ms.TypedSpec()
 
+	// Get machine count from MachineAllocation or deprecated MachineClass
+	var machineCount uint32
+	if alloc := spec.Value.GetMachineAllocation(); alloc != nil {
+		machineCount = alloc.GetMachineCount()
+	} else if mc := spec.Value.GetMachineClass(); mc != nil {
+		machineCount = mc.GetMachineCount()
+	}
+
 	return &MachineSetStatus{
 		Name:         machineSetName,
-		MachineCount: int(spec.Value.GetMachineCount()),
+		MachineCount: int(machineCount),
 	}, nil
 }
 
@@ -85,8 +93,15 @@ func (c *Client) ScaleMachineSet(ctx context.Context, machineSetName string, cou
 		return fmt.Errorf("failed to get machine set %s: %w", machineSetID, err)
 	}
 
-	// Update the machine count
-	ms.TypedSpec().Value.MachineCount = uint32(count)
+	// Update the machine count in MachineAllocation
+	spec := ms.TypedSpec().Value
+	if alloc := spec.GetMachineAllocation(); alloc != nil {
+		alloc.MachineCount = uint32(count)
+	} else if mc := spec.GetMachineClass(); mc != nil {
+		mc.MachineCount = uint32(count)
+	} else {
+		return fmt.Errorf("machine set %s has no machine allocation configured", machineSetID)
+	}
 
 	// Update the machine set
 	if err := st.Update(ctx, ms, state.WithUpdateOwner(ms.Metadata().Owner())); err != nil {
@@ -107,15 +122,27 @@ func (c *Client) ListMachineSets(ctx context.Context) ([]*MachineSetStatus, erro
 	}
 
 	var result []*MachineSetStatus
+	prefix := c.clusterName + "-"
 
 	for iter := list.Iterator(); iter.Next(); {
 		ms := iter.Value()
+		id := ms.Metadata().ID()
+
 		// Filter by cluster name prefix
-		if ms.Metadata().ID()[:len(c.clusterName)] == c.clusterName {
-			spec := ms.TypedSpec()
+		if len(id) > len(prefix) && id[:len(prefix)] == prefix {
+			spec := ms.TypedSpec().Value
+
+			// Get machine count from MachineAllocation or deprecated MachineClass
+			var machineCount uint32
+			if alloc := spec.GetMachineAllocation(); alloc != nil {
+				machineCount = alloc.GetMachineCount()
+			} else if mc := spec.GetMachineClass(); mc != nil {
+				machineCount = mc.GetMachineCount()
+			}
+
 			result = append(result, &MachineSetStatus{
-				Name:         ms.Metadata().ID()[len(c.clusterName)+1:],
-				MachineCount: int(spec.Value.GetMachineCount()),
+				Name:         id[len(prefix):],
+				MachineCount: int(machineCount),
 			})
 		}
 	}
