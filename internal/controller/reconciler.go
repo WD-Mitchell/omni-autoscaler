@@ -45,7 +45,7 @@ func NewAutoscaler(kubeClient kubernetes.Interface, omniClient *omni.Client, cfg
 func (a *Autoscaler) Run(ctx context.Context) error {
 	a.logger.Info("Starting autoscaler", "syncInterval", a.config.SyncInterval)
 
-	ticker := time.NewTicker(a.config.SyncInterval)
+	ticker := time.NewTicker(a.config.SyncInterval.Duration())
 	defer ticker.Stop()
 
 	// Run immediately on start
@@ -264,7 +264,7 @@ func (a *Autoscaler) canScaleUp(machineSet string) bool {
 	if !ok {
 		return true
 	}
-	return time.Since(lastScale) >= a.config.Cooldowns.ScaleUp
+	return time.Since(lastScale) >= a.config.Cooldowns.ScaleUp.Duration()
 }
 
 // canScaleDown checks if scale-down is allowed based on cooldown
@@ -274,7 +274,7 @@ func (a *Autoscaler) canScaleDown(machineSet string) bool {
 
 	// Also check if we recently scaled up
 	if lastUp, ok := a.lastScaleUp[machineSet]; ok {
-		if time.Since(lastUp) < a.config.Cooldowns.ScaleDown {
+		if time.Since(lastUp) < a.config.Cooldowns.ScaleDown.Duration() {
 			return false
 		}
 	}
@@ -283,5 +283,5 @@ func (a *Autoscaler) canScaleDown(machineSet string) bool {
 	if !ok {
 		return true
 	}
-	return time.Since(lastScale) >= a.config.Cooldowns.ScaleDown
+	return time.Since(lastScale) >= a.config.Cooldowns.ScaleDown.Duration()
 }

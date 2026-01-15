@@ -1,11 +1,41 @@
 package config
 
 import (
+	"encoding/json"
 	"os"
 	"time"
 
 	"sigs.k8s.io/yaml"
 )
+
+// Duration is a wrapper around time.Duration that supports YAML/JSON string parsing
+type Duration time.Duration
+
+// UnmarshalJSON implements json.Unmarshaler for Duration
+func (d *Duration) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		// Try unmarshaling as a number (nanoseconds)
+		var ns int64
+		if numErr := json.Unmarshal(data, &ns); numErr != nil {
+			return err
+		}
+		*d = Duration(ns)
+		return nil
+	}
+
+	parsed, err := time.ParseDuration(s)
+	if err != nil {
+		return err
+	}
+	*d = Duration(parsed)
+	return nil
+}
+
+// Duration returns the time.Duration value
+func (d Duration) Duration() time.Duration {
+	return time.Duration(d)
+}
 
 // Config holds the autoscaler configuration
 type Config struct {
@@ -18,7 +48,7 @@ type Config struct {
 	// Cooldowns defines the cooldown periods for scaling operations
 	Cooldowns CooldownConfig `json:"cooldowns"`
 	// SyncInterval is how often to check for scaling needs
-	SyncInterval time.Duration `json:"syncInterval"`
+	SyncInterval Duration `json:"syncInterval"`
 }
 
 // MachineSetConfig defines scaling parameters for a single machine set
@@ -38,9 +68,9 @@ type MachineSetConfig struct {
 // CooldownConfig defines cooldown periods between scaling operations
 type CooldownConfig struct {
 	// ScaleUp is the cooldown after a scale-up operation
-	ScaleUp time.Duration `json:"scaleUp"`
+	ScaleUp Duration `json:"scaleUp"`
 	// ScaleDown is the cooldown after a scale-down operation
-	ScaleDown time.Duration `json:"scaleDown"`
+	ScaleDown Duration `json:"scaleDown"`
 }
 
 // LoadFromFile loads configuration from a YAML file
@@ -57,13 +87,13 @@ func LoadFromFile(path string) (*Config, error) {
 
 	// Set defaults
 	if cfg.SyncInterval == 0 {
-		cfg.SyncInterval = 30 * time.Second
+		cfg.SyncInterval = Duration(30 * time.Second)
 	}
 	if cfg.Cooldowns.ScaleUp == 0 {
-		cfg.Cooldowns.ScaleUp = 2 * time.Minute
+		cfg.Cooldowns.ScaleUp = Duration(2 * time.Minute)
 	}
 	if cfg.Cooldowns.ScaleDown == 0 {
-		cfg.Cooldowns.ScaleDown = 10 * time.Minute
+		cfg.Cooldowns.ScaleDown = Duration(10 * time.Minute)
 	}
 
 	return &cfg, nil
