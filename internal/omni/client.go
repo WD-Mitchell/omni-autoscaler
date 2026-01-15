@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/cosi-project/runtime/pkg/safe"
 	"github.com/cosi-project/runtime/pkg/state"
@@ -65,14 +66,12 @@ func (c *Client) GetMachineSetStatus(ctx context.Context, machineSetName string)
 		return nil, fmt.Errorf("failed to get machine set %s: %w", machineSetID, err)
 	}
 
-	spec := ms.TypedSpec()
+	spec := ms.TypedSpec().Value
 
-	// Get machine count from MachineAllocation or deprecated MachineClass
+	// Get machine count from MachineClass (v0.38.0 API)
 	var machineCount uint32
-	if alloc := spec.Value.GetMachineAllocation(); alloc != nil {
-		machineCount = alloc.GetMachineCount()
-	} else if mc := spec.Value.GetMachineClass(); mc != nil {
-		machineCount = mc.GetMachineCount()
+	if spec.MachineClass != nil {
+		machineCount = spec.MachineClass.MachineCount
 	}
 
 	return &MachineSetStatus{
@@ -93,15 +92,12 @@ func (c *Client) ScaleMachineSet(ctx context.Context, machineSetName string, cou
 		return fmt.Errorf("failed to get machine set %s: %w", machineSetID, err)
 	}
 
-	// Update the machine count in MachineAllocation
+	// Update the machine count in MachineClass (v0.38.0 API)
 	spec := ms.TypedSpec().Value
-	if alloc := spec.GetMachineAllocation(); alloc != nil {
-		alloc.MachineCount = uint32(count)
-	} else if mc := spec.GetMachineClass(); mc != nil {
-		mc.MachineCount = uint32(count)
-	} else {
-		return fmt.Errorf("machine set %s has no machine allocation configured", machineSetID)
+	if spec.MachineClass == nil {
+		return fmt.Errorf("machine set %s has no machine class configured", machineSetID)
 	}
+	spec.MachineClass.MachineCount = uint32(count)
 
 	// Update the machine set
 	if err := st.Update(ctx, ms, state.WithUpdateOwner(ms.Metadata().Owner())); err != nil {
@@ -129,19 +125,17 @@ func (c *Client) ListMachineSets(ctx context.Context) ([]*MachineSetStatus, erro
 		id := ms.Metadata().ID()
 
 		// Filter by cluster name prefix
-		if len(id) > len(prefix) && id[:len(prefix)] == prefix {
+		if strings.HasPrefix(id, prefix) {
 			spec := ms.TypedSpec().Value
 
-			// Get machine count from MachineAllocation or deprecated MachineClass
+			// Get machine count from MachineClass (v0.38.0 API)
 			var machineCount uint32
-			if alloc := spec.GetMachineAllocation(); alloc != nil {
-				machineCount = alloc.GetMachineCount()
-			} else if mc := spec.GetMachineClass(); mc != nil {
-				machineCount = mc.GetMachineCount()
+			if spec.MachineClass != nil {
+				machineCount = spec.MachineClass.MachineCount
 			}
 
 			result = append(result, &MachineSetStatus{
-				Name:         id[len(prefix):],
+				Name:         strings.TrimPrefix(id, prefix),
 				MachineCount: int(machineCount),
 			})
 		}
