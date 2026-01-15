@@ -1,0 +1,24 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omni-autoscaler-config
+  namespace: omni-autoscaler
+data:
+  config.yaml: |
+    # Omni API endpoint
+    omniEndpoint: "https://omni.wdmitchell.dev"
+    # Cluster name in Omni
+    clusterName: "hyperion"
+    # Sync interval for checking scaling needs
+    syncInterval: 30s
+    # Cooldown configuration
+    cooldowns:
+      scaleUp: 2m
+      scaleDown: 10m
+    # Machine set configurations for hyperion
+    machineSets:
+      - name: "worker-medium"
+        minSize: 2
+        maxSize: 8
+        scaleUpPendingPods: 1
+        scaleDownUtilization: 0.3

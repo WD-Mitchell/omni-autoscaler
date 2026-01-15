@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: omni-autoscaler-config
+  namespace: omni-autoscaler
+  labels:
+    app.kubernetes.io/name: omni-autoscaler
+data:
+  config.yaml: |
+    # Omni API endpoint - override in cluster overlay
+    omniEndpoint: "https://omni.example.com"
+    # Cluster name in Omni - override in cluster overlay
+    clusterName: "my-cluster"
+    # Sync interval for checking scaling needs
+    syncInterval: 30s
+    # Cooldown configuration
+    cooldowns:
+      scaleUp: 2m
+      scaleDown: 10m
+    # Machine set configurations - override in cluster overlay
+    machineSets:
+      - name: "worker"
+        minSize: 1
+        maxSize: 5
+        scaleUpPendingPods: 1
+        scaleDownUtilization: 0.3

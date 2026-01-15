@@ -1,0 +1,22 @@
+# Binaries
+bin/
+*.exe
+
+# IDE
+.idea/
+.vscode/
+
+# Dependencies
+vendor/
+
+# Test artifacts
+*.test
+coverage.out
+
+# Local config
+config.yaml
+*.local.yaml
+
+# OS files
+.DS_Store
+Thumbs.db
