@@ -54,6 +54,19 @@ type MachineSetStatus struct {
 	ReadyCount   int
 }
 
+// getMachineCount extracts machine count from MachineAllocation or deprecated MachineClass
+func getMachineCount(spec interface{ GetMachineAllocation() interface{ GetMachineCount() uint32 }; GetMachineClass() interface{ GetMachineCount() uint32 } }) (uint32, bool) {
+	// Check MachineAllocation first (new field)
+	if alloc := spec.GetMachineAllocation(); alloc != nil {
+		return alloc.GetMachineCount(), true
+	}
+	// Fall back to deprecated MachineClass
+	if mc := spec.GetMachineClass(); mc != nil {
+		return mc.GetMachineCount(), true
+	}
+	return 0, false
+}
+
 // GetMachineSetStatus gets the current status of a machine set
 func (c *Client) GetMachineSetStatus(ctx context.Context, machineSetName string) (*MachineSetStatus, error) {
 	st := c.client.Omni().State()
@@ -68,9 +81,11 @@ func (c *Client) GetMachineSetStatus(ctx context.Context, machineSetName string)
 
 	spec := ms.TypedSpec().Value
 
-	// Get machine count from MachineClass (v0.38.0 API)
+	// Get machine count - check MachineAllocation first (new), then MachineClass (deprecated)
 	var machineCount uint32
-	if spec.MachineClass != nil {
+	if spec.MachineAllocation != nil {
+		machineCount = spec.MachineAllocation.MachineCount
+	} else if spec.MachineClass != nil {
 		machineCount = spec.MachineClass.MachineCount
 	}
 
@@ -92,12 +107,15 @@ func (c *Client) ScaleMachineSet(ctx context.Context, machineSetName string, cou
 		return fmt.Errorf("failed to get machine set %s: %w", machineSetID, err)
 	}
 
-	// Update the machine count in MachineClass (v0.38.0 API)
+	// Update the machine count - check MachineAllocation first (new), then MachineClass (deprecated)
 	spec := ms.TypedSpec().Value
-	if spec.MachineClass == nil {
-		return fmt.Errorf("machine set %s has no machine class configured", machineSetID)
+	if spec.MachineAllocation != nil {
+		spec.MachineAllocation.MachineCount = uint32(count)
+	} else if spec.MachineClass != nil {
+		spec.MachineClass.MachineCount = uint32(count)
+	} else {
+		return fmt.Errorf("machine set %s has no machine allocation configured", machineSetID)
 	}
-	spec.MachineClass.MachineCount = uint32(count)
 
 	// Update the machine set
 	if err := st.Update(ctx, ms, state.WithUpdateOwner(ms.Metadata().Owner())); err != nil {
@@ -128,9 +146,11 @@ func (c *Client) ListMachineSets(ctx context.Context) ([]*MachineSetStatus, erro
 		if strings.HasPrefix(id, prefix) {
 			spec := ms.TypedSpec().Value
 
-			// Get machine count from MachineClass (v0.38.0 API)
+			// Get machine count - check MachineAllocation first (new), then MachineClass (deprecated)
 			var machineCount uint32
-			if spec.MachineClass != nil {
+			if spec.MachineAllocation != nil {
+				machineCount = spec.MachineAllocation.MachineCount
+			} else if spec.MachineClass != nil {
 				machineCount = spec.MachineClass.MachineCount
 			}
 
