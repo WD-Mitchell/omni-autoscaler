@@ -6,7 +6,7 @@ metadata:
 data:
   config.yaml: |
     # Omni API endpoint
-    omniEndpoint: "https://omni.wdmitchell.dev"
+    omniEndpoint: "https://api.omni.wdmitchell.uk"
     # Cluster name in Omni
     clusterName: "hyperion"
     # Sync interval for checking scaling needs
