@@ -8,7 +8,6 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -76,15 +75,22 @@ func (a *Autoscaler) reconcile(ctx context.Context) error {
 		return fmt.Errorf("failed to get pending pods: %w", err)
 	}
 
-	// Get node utilization
-	nodeUtil, err := a.getNodeUtilization(ctx)
+	// Get cluster resources (detailed CPU/memory info)
+	resources, err := a.getClusterResources(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get node utilization: %w", err)
+		return fmt.Errorf("failed to get cluster resources: %w", err)
 	}
+
+	a.logger.Debug("Cluster status",
+		"workerNodes", resources.WorkerCount,
+		"cpuUtil", fmt.Sprintf("%.1f%%", resources.CPUUtilization*100),
+		"memUtil", fmt.Sprintf("%.1f%%", resources.MemUtilization*100),
+		"pendingPods", len(pendingPods),
+	)
 
 	// Check each configured machine set
 	for _, msConfig := range a.config.MachineSets {
-		if err := a.reconcileMachineSet(ctx, msConfig, len(pendingPods), nodeUtil); err != nil {
+		if err := a.reconcileMachineSet(ctx, msConfig, pendingPods, resources); err != nil {
 			a.logger.Error("Failed to reconcile machine set", "machineSet", msConfig.Name, "error", err)
 		}
 	}
@@ -93,7 +99,7 @@ func (a *Autoscaler) reconcile(ctx context.Context) error {
 }
 
 // reconcileMachineSet handles scaling decisions for a single machine set
-func (a *Autoscaler) reconcileMachineSet(ctx context.Context, msConfig config.MachineSetConfig, pendingPodCount int, nodeUtil float64) error {
+func (a *Autoscaler) reconcileMachineSet(ctx context.Context, msConfig config.MachineSetConfig, pendingPods []corev1.Pod, resources *ClusterResources) error {
 	// Get current machine set status
 	status, err := a.omniClient.GetMachineSetStatus(ctx, msConfig.Name)
 	if err != nil {
@@ -102,50 +108,103 @@ func (a *Autoscaler) reconcileMachineSet(ctx context.Context, msConfig config.Ma
 
 	currentCount := status.MachineCount
 	desiredCount := currentCount
+	pendingPodCount := len(pendingPods)
 
 	a.logger.Debug("Evaluating machine set",
 		"machineSet", msConfig.Name,
 		"currentCount", currentCount,
 		"pendingPods", pendingPodCount,
-		"nodeUtilization", fmt.Sprintf("%.2f%%", nodeUtil*100),
+		"cpuUtil", fmt.Sprintf("%.1f%%", resources.CPUUtilization*100),
+		"memUtil", fmt.Sprintf("%.1f%%", resources.MemUtilization*100),
+		"scaleUpThreshold", fmt.Sprintf("%.1f%%", msConfig.ScaleUpThreshold*100),
+		"scaleDownThreshold", fmt.Sprintf("%.1f%%", msConfig.ScaleDownThreshold*100),
 	)
 
-	// Check if we need to scale up
+	// === SCALE UP LOGIC ===
+	// Scale up when:
+	// 1. There are pending pods (reactive)
+	// 2. Cluster utilization exceeds threshold (proactive)
+	shouldScaleUp := false
+	scaleUpReason := ""
+
+	// Check for pending pods (highest priority)
 	if pendingPodCount >= msConfig.ScaleUpPendingPods && currentCount < msConfig.MaxSize {
+		shouldScaleUp = true
+		scaleUpReason = fmt.Sprintf("%d pending pods", pendingPodCount)
+	}
+
+	// Check for high utilization (proactive scaling)
+	if !shouldScaleUp && resources.MaxUtilization >= msConfig.ScaleUpThreshold && currentCount < msConfig.MaxSize {
+		shouldScaleUp = true
+		scaleUpReason = fmt.Sprintf("utilization %.1f%% exceeds threshold %.1f%% (cpu=%.1f%%, mem=%.1f%%)",
+			resources.MaxUtilization*100, msConfig.ScaleUpThreshold*100,
+			resources.CPUUtilization*100, resources.MemUtilization*100)
+	}
+
+	if shouldScaleUp {
 		if a.canScaleUp(msConfig.Name) {
-			// Scale up by 1 (or more based on pending pods)
-			increment := min((pendingPodCount/msConfig.ScaleUpPendingPods), msConfig.MaxSize-currentCount)
-			if increment < 1 {
-				increment = 1
+			// Calculate how many nodes to add
+			increment := 1
+			if pendingPodCount > 0 {
+				// Scale up based on pending pods
+				increment = max(1, pendingPodCount/msConfig.ScaleUpPendingPods)
+			} else {
+				// Proactive scaling: add enough to get below target utilization
+				// Estimate: if we're at X% util with N nodes, we need N * X / target nodes
+				if resources.MaxUtilization > msConfig.TargetUtilization && resources.WorkerCount > 0 {
+					targetNodes := int(float64(resources.WorkerCount) * resources.MaxUtilization / msConfig.TargetUtilization)
+					increment = max(1, targetNodes-resources.WorkerCount)
+				}
 			}
+			increment = min(increment, msConfig.MaxSize-currentCount)
 			desiredCount = currentCount + increment
-			desiredCount = min(desiredCount, msConfig.MaxSize)
 
 			a.logger.Info("Scaling up",
 				"machineSet", msConfig.Name,
 				"from", currentCount,
 				"to", desiredCount,
-				"reason", fmt.Sprintf("%d pending pods", pendingPodCount),
+				"reason", scaleUpReason,
 			)
 		} else {
 			a.logger.Debug("Scale-up on cooldown", "machineSet", msConfig.Name)
 		}
 	}
 
-	// Check if we need to scale down
-	if nodeUtil < msConfig.ScaleDownUtilization && currentCount > msConfig.MinSize && pendingPodCount == 0 {
-		if a.canScaleDown(msConfig.Name) {
-			desiredCount = currentCount - 1
-			desiredCount = max(desiredCount, msConfig.MinSize)
+	// === SCALE DOWN LOGIC ===
+	// Scale down when:
+	// 1. Utilization is below threshold
+	// 2. No pending pods
+	// 3. We can safely consolidate (pods would fit on remaining nodes)
+	if desiredCount == currentCount && currentCount > msConfig.MinSize && pendingPodCount == 0 {
+		if resources.MaxUtilization < msConfig.ScaleDownThreshold {
+			if a.canScaleDown(msConfig.Name) {
+				// Find the least utilized worker node
+				leastUtilized := a.getLeastUtilizedWorker(resources)
+				if leastUtilized != nil {
+					// Check if we can safely remove this node
+					if a.canConsolidateNode(resources, leastUtilized.Name, msConfig.SafeToEvictBuffer) {
+						desiredCount = currentCount - 1
 
-			a.logger.Info("Scaling down",
-				"machineSet", msConfig.Name,
-				"from", currentCount,
-				"to", desiredCount,
-				"reason", fmt.Sprintf("utilization %.2f%% below threshold %.2f%%", nodeUtil*100, msConfig.ScaleDownUtilization*100),
-			)
-		} else {
-			a.logger.Debug("Scale-down on cooldown", "machineSet", msConfig.Name)
+						a.logger.Info("Scaling down",
+							"machineSet", msConfig.Name,
+							"from", currentCount,
+							"to", desiredCount,
+							"targetNode", leastUtilized.Name,
+							"nodeUtil", fmt.Sprintf("%.1f%%", leastUtilized.MaxUtilization*100),
+							"reason", fmt.Sprintf("cluster utilization %.1f%% below threshold %.1f%%, node %s can be consolidated",
+								resources.MaxUtilization*100, msConfig.ScaleDownThreshold*100, leastUtilized.Name),
+						)
+					} else {
+						a.logger.Debug("Cannot scale down - consolidation would exceed capacity",
+							"machineSet", msConfig.Name,
+							"targetNode", leastUtilized.Name,
+							"safetyBuffer", fmt.Sprintf("%.1f%%", msConfig.SafeToEvictBuffer*100),
+						)
+					}
+				}
+			} else {
+				a.logger.Debug("Scale-down on cooldown", "machineSet", msConfig.Name)
+			}
 		}
 	}
 
@@ -205,66 +264,201 @@ func (a *Autoscaler) getPendingPods(ctx context.Context) ([]corev1.Pod, error) {
 	return pendingPods, nil
 }
 
-// getNodeUtilization calculates the average CPU/memory utilization across all nodes
-func (a *Autoscaler) getNodeUtilization(ctx context.Context) (float64, error) {
+// NodeResources tracks resource usage for a single node
+type NodeResources struct {
+	Name            string
+	CPUAllocatable  int64 // millicores
+	CPURequested    int64 // millicores
+	MemAllocatable  int64 // bytes
+	MemRequested    int64 // bytes
+	CPUUtilization  float64
+	MemUtilization  float64
+	MaxUtilization  float64 // max of CPU and memory utilization
+	PodCount        int
+	IsControlPlane  bool
+}
+
+// ClusterResources aggregates resource information across the cluster
+type ClusterResources struct {
+	Nodes              []NodeResources
+	TotalCPUAllocatable int64
+	TotalCPURequested   int64
+	TotalMemAllocatable int64
+	TotalMemRequested   int64
+	CPUUtilization      float64
+	MemUtilization      float64
+	MaxUtilization      float64 // max of CPU and memory
+	WorkerCount         int
+	// Per-node pod assignments for consolidation checks
+	NodePods map[string][]corev1.Pod
+}
+
+// getClusterResources calculates detailed resource usage across the cluster
+func (a *Autoscaler) getClusterResources(ctx context.Context) (*ClusterResources, error) {
 	nodes, err := a.kubeClient.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
 	if err != nil {
-		return 0, err
+		return nil, fmt.Errorf("failed to list nodes: %w", err)
 	}
 
-	if len(nodes.Items) == 0 {
-		return 0, nil
-	}
-
-	// Get all pods to calculate resource usage
+	// Get all running pods
 	pods, err := a.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
 		FieldSelector: "status.phase=Running",
 	})
 	if err != nil {
-		return 0, err
+		return nil, fmt.Errorf("failed to list pods: %w", err)
 	}
 
-	// Calculate requested resources per node
-	nodeRequests := make(map[string]resource.Quantity)
+	// Calculate requested resources per node and track pod assignments
+	nodeCPURequests := make(map[string]int64)
+	nodeMemRequests := make(map[string]int64)
+	nodePodCounts := make(map[string]int)
+	nodePods := make(map[string][]corev1.Pod)
+
 	for _, pod := range pods.Items {
 		if pod.Spec.NodeName == "" {
 			continue
 		}
+		nodePodCounts[pod.Spec.NodeName]++
+		nodePods[pod.Spec.NodeName] = append(nodePods[pod.Spec.NodeName], pod)
+
 		for _, container := range pod.Spec.Containers {
 			if cpu := container.Resources.Requests.Cpu(); cpu != nil {
-				current := nodeRequests[pod.Spec.NodeName]
-				current.Add(*cpu)
-				nodeRequests[pod.Spec.NodeName] = current
+				nodeCPURequests[pod.Spec.NodeName] += cpu.MilliValue()
+			}
+			if mem := container.Resources.Requests.Memory(); mem != nil {
+				nodeMemRequests[pod.Spec.NodeName] += mem.Value()
 			}
 		}
 	}
 
-	// Calculate average utilization
-	var totalUtil float64
-	var workerCount int
+	resources := &ClusterResources{
+		Nodes:    make([]NodeResources, 0, len(nodes.Items)),
+		NodePods: nodePods,
+	}
 
 	for _, node := range nodes.Items {
-		// Skip control plane nodes
+		isControlPlane := false
 		if _, ok := node.Labels["node-role.kubernetes.io/control-plane"]; ok {
-			continue
+			isControlPlane = true
 		}
 
-		allocatable := node.Status.Allocatable.Cpu()
-		if allocatable.IsZero() {
-			continue
+		cpuAllocatable := node.Status.Allocatable.Cpu().MilliValue()
+		memAllocatable := node.Status.Allocatable.Memory().Value()
+		cpuRequested := nodeCPURequests[node.Name]
+		memRequested := nodeMemRequests[node.Name]
+
+		var cpuUtil, memUtil float64
+		if cpuAllocatable > 0 {
+			cpuUtil = float64(cpuRequested) / float64(cpuAllocatable)
+		}
+		if memAllocatable > 0 {
+			memUtil = float64(memRequested) / float64(memAllocatable)
+		}
+		maxUtil := cpuUtil
+		if memUtil > maxUtil {
+			maxUtil = memUtil
 		}
 
-		requested := nodeRequests[node.Name]
-		util := float64(requested.MilliValue()) / float64(allocatable.MilliValue())
-		totalUtil += util
-		workerCount++
+		nodeRes := NodeResources{
+			Name:            node.Name,
+			CPUAllocatable:  cpuAllocatable,
+			CPURequested:    cpuRequested,
+			MemAllocatable:  memAllocatable,
+			MemRequested:    memRequested,
+			CPUUtilization:  cpuUtil,
+			MemUtilization:  memUtil,
+			MaxUtilization:  maxUtil,
+			PodCount:        nodePodCounts[node.Name],
+			IsControlPlane:  isControlPlane,
+		}
+		resources.Nodes = append(resources.Nodes, nodeRes)
+
+		// Only count worker nodes for totals
+		if !isControlPlane {
+			resources.TotalCPUAllocatable += cpuAllocatable
+			resources.TotalCPURequested += cpuRequested
+			resources.TotalMemAllocatable += memAllocatable
+			resources.TotalMemRequested += memRequested
+			resources.WorkerCount++
+		}
 	}
 
-	if workerCount == 0 {
-		return 0, nil
+	// Calculate cluster-wide utilization
+	if resources.TotalCPUAllocatable > 0 {
+		resources.CPUUtilization = float64(resources.TotalCPURequested) / float64(resources.TotalCPUAllocatable)
+	}
+	if resources.TotalMemAllocatable > 0 {
+		resources.MemUtilization = float64(resources.TotalMemRequested) / float64(resources.TotalMemAllocatable)
+	}
+	resources.MaxUtilization = resources.CPUUtilization
+	if resources.MemUtilization > resources.MaxUtilization {
+		resources.MaxUtilization = resources.MemUtilization
 	}
 
-	return totalUtil / float64(workerCount), nil
+	return resources, nil
+}
+
+// getLeastUtilizedWorker returns the worker node with the lowest max utilization
+func (a *Autoscaler) getLeastUtilizedWorker(resources *ClusterResources) *NodeResources {
+	var leastUtilized *NodeResources
+	for i := range resources.Nodes {
+		node := &resources.Nodes[i]
+		if node.IsControlPlane {
+			continue
+		}
+		if leastUtilized == nil || node.MaxUtilization < leastUtilized.MaxUtilization {
+			leastUtilized = node
+		}
+	}
+	return leastUtilized
+}
+
+// canConsolidateNode checks if pods from a node can fit on remaining nodes
+func (a *Autoscaler) canConsolidateNode(resources *ClusterResources, nodeToRemove string, safetyBuffer float64) bool {
+	// Find the node to remove and its pods
+	var nodeRes *NodeResources
+	for i := range resources.Nodes {
+		if resources.Nodes[i].Name == nodeToRemove {
+			nodeRes = &resources.Nodes[i]
+			break
+		}
+	}
+	if nodeRes == nil {
+		return false
+	}
+
+	// Calculate remaining capacity after removing this node
+	remainingCPUAllocatable := resources.TotalCPUAllocatable - nodeRes.CPUAllocatable
+	remainingMemAllocatable := resources.TotalMemAllocatable - nodeRes.MemAllocatable
+
+	// Total requests stay the same (pods will move to other nodes)
+	totalCPURequested := resources.TotalCPURequested
+	totalMemRequested := resources.TotalMemRequested
+
+	if remainingCPUAllocatable <= 0 || remainingMemAllocatable <= 0 {
+		return false
+	}
+
+	// Check if pods would fit with safety buffer
+	cpuUtilAfter := float64(totalCPURequested) / float64(remainingCPUAllocatable)
+	memUtilAfter := float64(totalMemRequested) / float64(remainingMemAllocatable)
+	maxUtilAfter := cpuUtilAfter
+	if memUtilAfter > maxUtilAfter {
+		maxUtilAfter = memUtilAfter
+	}
+
+	// Allow consolidation if resulting utilization is below (1 - safety buffer)
+	maxAllowedUtil := 1.0 - safetyBuffer
+	return maxUtilAfter <= maxAllowedUtil
+}
+
+// getNodeUtilization calculates the average CPU/memory utilization across all nodes (legacy compatibility)
+func (a *Autoscaler) getNodeUtilization(ctx context.Context) (float64, error) {
+	resources, err := a.getClusterResources(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return resources.CPUUtilization, nil
 }
 
 // canScaleUp checks if scale-up is allowed based on cooldown

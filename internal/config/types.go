@@ -64,8 +64,20 @@ type MachineSetConfig struct {
 	MaxSize int `json:"maxSize"`
 	// ScaleUpPendingPods triggers scale-up when this many pods are pending
 	ScaleUpPendingPods int `json:"scaleUpPendingPods"`
-	// ScaleDownUtilization triggers scale-down when node utilization is below this
+	// ScaleDownUtilization triggers scale-down when node utilization is below this (legacy, used as fallback)
 	ScaleDownUtilization float64 `json:"scaleDownUtilization"`
+	// TargetUtilization is the desired cluster utilization (0.0-1.0)
+	// Scale up proactively when utilization exceeds this, scale down when below
+	TargetUtilization float64 `json:"targetUtilization"`
+	// ScaleUpThreshold triggers proactive scale-up when utilization exceeds this (0.0-1.0)
+	// Defaults to TargetUtilization + 0.1 if not set
+	ScaleUpThreshold float64 `json:"scaleUpThreshold"`
+	// ScaleDownThreshold triggers scale-down evaluation when utilization is below this (0.0-1.0)
+	// Defaults to TargetUtilization - 0.15 if not set
+	ScaleDownThreshold float64 `json:"scaleDownThreshold"`
+	// SafeToEvictBuffer is extra capacity (0.0-1.0) required on remaining nodes before scale-down
+	// E.g., 0.1 means nodes must have 10% extra capacity after consolidation
+	SafeToEvictBuffer float64 `json:"safeToEvictBuffer"`
 }
 
 // CooldownConfig defines cooldown periods between scaling operations
@@ -104,6 +116,28 @@ func LoadFromFile(path string) (*Config, error) {
 			"kube-public",
 			"kube-node-lease",
 			"flux-system",
+		}
+	}
+
+	// Set defaults for machine set configs
+	for i := range cfg.MachineSets {
+		ms := &cfg.MachineSets[i]
+		if ms.TargetUtilization == 0 {
+			ms.TargetUtilization = 0.5 // Default 50% target utilization
+		}
+		if ms.ScaleUpThreshold == 0 {
+			ms.ScaleUpThreshold = ms.TargetUtilization + 0.15 // Default: target + 15%
+		}
+		if ms.ScaleDownThreshold == 0 {
+			// Use legacy ScaleDownUtilization if set, otherwise target - 15%
+			if ms.ScaleDownUtilization > 0 {
+				ms.ScaleDownThreshold = ms.ScaleDownUtilization
+			} else {
+				ms.ScaleDownThreshold = ms.TargetUtilization - 0.15
+			}
+		}
+		if ms.SafeToEvictBuffer == 0 {
+			ms.SafeToEvictBuffer = 0.1 // Default 10% buffer
 		}
 	}
 
