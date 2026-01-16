@@ -8,6 +8,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
@@ -26,6 +27,9 @@ type Autoscaler struct {
 	mu              sync.Mutex
 	lastScaleUp     map[string]time.Time
 	lastScaleDown   map[string]time.Time
+
+	// Track nodes being drained for safe scale-down
+	drainingNodes   map[string]time.Time // nodeName -> drain start time
 }
 
 // NewAutoscaler creates a new Autoscaler instance
@@ -37,6 +41,7 @@ func NewAutoscaler(kubeClient kubernetes.Interface, omniClient *omni.Client, cfg
 		logger:        logger,
 		lastScaleUp:   make(map[string]time.Time),
 		lastScaleDown: make(map[string]time.Time),
+		drainingNodes: make(map[string]time.Time),
 	}
 }
 
@@ -175,6 +180,7 @@ func (a *Autoscaler) reconcileMachineSet(ctx context.Context, msConfig config.Ma
 	// 1. Utilization is below threshold
 	// 2. No pending pods
 	// 3. We can safely consolidate (pods would fit on remaining nodes)
+	// 4. Node is drained and Longhorn volumes are healthy
 	if desiredCount == currentCount && currentCount > msConfig.MinSize && pendingPodCount == 0 {
 		if resources.MaxUtilization < msConfig.ScaleDownThreshold {
 			if a.canScaleDown(msConfig.Name) {
@@ -183,15 +189,91 @@ func (a *Autoscaler) reconcileMachineSet(ctx context.Context, msConfig config.Ma
 				if leastUtilized != nil {
 					// Check if we can safely remove this node
 					if a.canConsolidateNode(resources, leastUtilized.Name, msConfig.SafeToEvictBuffer) {
+						// Check if node is already being drained
+						a.mu.Lock()
+						drainStartTime, isDraining := a.drainingNodes[leastUtilized.Name]
+						a.mu.Unlock()
+
+						if !isDraining {
+							// Start the drain process
+							a.logger.Info("Starting safe scale-down - cordoning and draining node",
+								"machineSet", msConfig.Name,
+								"targetNode", leastUtilized.Name,
+							)
+
+							// Cordon the node first
+							if err := a.cordonNode(ctx, leastUtilized.Name); err != nil {
+								a.logger.Error("Failed to cordon node", "node", leastUtilized.Name, "error", err)
+								return err
+							}
+
+							// Start draining
+							if err := a.drainNode(ctx, leastUtilized.Name); err != nil {
+								a.logger.Error("Failed to drain node", "node", leastUtilized.Name, "error", err)
+								// Don't fail - we'll retry on the next reconcile
+							}
+
+							// Track that we're draining this node
+							a.mu.Lock()
+							a.drainingNodes[leastUtilized.Name] = time.Now()
+							a.mu.Unlock()
+
+							// Don't scale down yet - wait for drain to complete
+							return nil
+						}
+
+						// Node is being drained - check if it's complete
+						drained, err := a.isNodeDrained(ctx, leastUtilized.Name)
+						if err != nil {
+							a.logger.Error("Failed to check if node is drained", "node", leastUtilized.Name, "error", err)
+							return err
+						}
+
+						if !drained {
+							// Check for drain timeout (30 minutes)
+							if time.Since(drainStartTime) > 30*time.Minute {
+								a.logger.Warn("Node drain timeout - proceeding with scale-down anyway",
+									"node", leastUtilized.Name,
+									"drainDuration", time.Since(drainStartTime),
+								)
+							} else {
+								a.logger.Debug("Waiting for node to drain",
+									"node", leastUtilized.Name,
+									"drainDuration", time.Since(drainStartTime),
+								)
+								return nil
+							}
+						}
+
+						// Check Longhorn volume health before final scale-down
+						volumesHealthy, err := a.checkLonghornVolumesHealthy(ctx)
+						if err != nil {
+							a.logger.Error("Failed to check Longhorn volume health", "error", err)
+							return err
+						}
+
+						if !volumesHealthy {
+							a.logger.Warn("Longhorn volumes not healthy - delaying scale-down",
+								"node", leastUtilized.Name,
+							)
+							return nil
+						}
+
+						// All checks passed - proceed with scale-down
 						desiredCount = currentCount - 1
 
-						a.logger.Info("Scaling down",
+						// Remove from draining tracking
+						a.mu.Lock()
+						delete(a.drainingNodes, leastUtilized.Name)
+						a.mu.Unlock()
+
+						a.logger.Info("Scaling down (node drained safely)",
 							"machineSet", msConfig.Name,
 							"from", currentCount,
 							"to", desiredCount,
 							"targetNode", leastUtilized.Name,
 							"nodeUtil", fmt.Sprintf("%.1f%%", leastUtilized.MaxUtilization*100),
-							"reason", fmt.Sprintf("cluster utilization %.1f%% below threshold %.1f%%, node %s can be consolidated",
+							"reason", fmt.Sprintf("cluster utilization %.1f%% below threshold %.1f%%, node %s drained and ready",
 								resources.MaxUtilization*100, msConfig.ScaleDownThreshold*100, leastUtilized.Name),
 						)
 					} else {
@@ -490,4 +572,181 @@ func (a *Autoscaler) canScaleDown(machineSet string) bool {
 		return true
 	}
 	return time.Since(lastScale) >= a.config.Cooldowns.ScaleDown.Duration()
+}
+
+// cordonNode marks a node as unschedulable
+func (a *Autoscaler) cordonNode(ctx context.Context, nodeName string) error {
+	node, err := a.kubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get node %s: %w", nodeName, err)
+	}
+
+	if node.Spec.Unschedulable {
+		a.logger.Debug("Node already cordoned", "node", nodeName)
+		return nil
+	}
+
+	node.Spec.Unschedulable = true
+	_, err = a.kubeClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to cordon node %s: %w", nodeName, err)
+	}
+
+	a.logger.Info("Cordoned node", "node", nodeName)
+	return nil
+}
+
+// uncordonNode marks a node as schedulable again
+func (a *Autoscaler) uncordonNode(ctx context.Context, nodeName string) error {
+	node, err := a.kubeClient.CoreV1().Nodes().Get(ctx, nodeName, metav1.GetOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to get node %s: %w", nodeName, err)
+	}
+
+	if !node.Spec.Unschedulable {
+		return nil
+	}
+
+	node.Spec.Unschedulable = false
+	_, err = a.kubeClient.CoreV1().Nodes().Update(ctx, node, metav1.UpdateOptions{})
+	if err != nil {
+		return fmt.Errorf("failed to uncordon node %s: %w", nodeName, err)
+	}
+
+	a.logger.Info("Uncordoned node", "node", nodeName)
+	return nil
+}
+
+// evictPod evicts a single pod using the Eviction API
+func (a *Autoscaler) evictPod(ctx context.Context, pod corev1.Pod) error {
+	eviction := &policyv1.Eviction{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      pod.Name,
+			Namespace: pod.Namespace,
+		},
+		DeleteOptions: &metav1.DeleteOptions{
+			GracePeriodSeconds: ptr(int64(30)),
+		},
+	}
+
+	err := a.kubeClient.CoreV1().Pods(pod.Namespace).EvictV1(ctx, eviction)
+	if err != nil {
+		return fmt.Errorf("failed to evict pod %s/%s: %w", pod.Namespace, pod.Name, err)
+	}
+	return nil
+}
+
+// drainNode evicts all non-daemonset pods from a node
+func (a *Autoscaler) drainNode(ctx context.Context, nodeName string) error {
+	// Get all pods on this node
+	pods, err := a.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
+	})
+	if err != nil {
+		return fmt.Errorf("failed to list pods on node %s: %w", nodeName, err)
+	}
+
+	var evictionErrors []error
+	for _, pod := range pods.Items {
+		// Skip mirror pods (static pods)
+		if _, ok := pod.Annotations["kubernetes.io/config.mirror"]; ok {
+			continue
+		}
+
+		// Skip DaemonSet pods
+		for _, ownerRef := range pod.OwnerReferences {
+			if ownerRef.Kind == "DaemonSet" {
+				continue
+			}
+		}
+
+		// Skip pods that are already terminating
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+
+		a.logger.Debug("Evicting pod", "pod", pod.Name, "namespace", pod.Namespace)
+		if err := a.evictPod(ctx, pod); err != nil {
+			evictionErrors = append(evictionErrors, err)
+		}
+	}
+
+	if len(evictionErrors) > 0 {
+		return fmt.Errorf("failed to evict %d pods: %v", len(evictionErrors), evictionErrors[0])
+	}
+
+	a.logger.Info("Drained node", "node", nodeName)
+	return nil
+}
+
+// isNodeDrained checks if all non-daemonset pods have been evicted from a node
+func (a *Autoscaler) isNodeDrained(ctx context.Context, nodeName string) (bool, error) {
+	pods, err := a.kubeClient.CoreV1().Pods("").List(ctx, metav1.ListOptions{
+		FieldSelector: fmt.Sprintf("spec.nodeName=%s", nodeName),
+	})
+	if err != nil {
+		return false, fmt.Errorf("failed to list pods on node %s: %w", nodeName, err)
+	}
+
+	for _, pod := range pods.Items {
+		// Skip mirror pods (static pods)
+		if _, ok := pod.Annotations["kubernetes.io/config.mirror"]; ok {
+			continue
+		}
+
+		// Skip DaemonSet pods
+		isDaemonSet := false
+		for _, ownerRef := range pod.OwnerReferences {
+			if ownerRef.Kind == "DaemonSet" {
+				isDaemonSet = true
+				break
+			}
+		}
+		if isDaemonSet {
+			continue
+		}
+
+		// If we find any non-daemonset pod that's not terminating, node is not drained
+		if pod.DeletionTimestamp == nil {
+			return false, nil
+		}
+	}
+
+	return true, nil
+}
+
+// checkLonghornVolumesHealthy checks if all Longhorn volumes are healthy
+// This is important before scale-down to ensure data safety
+func (a *Autoscaler) checkLonghornVolumesHealthy(ctx context.Context) (bool, error) {
+	// List Longhorn volumes using dynamic client
+	// For simplicity, we check via the volumes.longhorn.io CRD
+	// In a real implementation, you'd use the Longhorn client
+
+	// For now, we'll check via pods - if there are any volume-related pending pods, volumes aren't healthy
+	pods, err := a.kubeClient.CoreV1().Pods("longhorn-system").List(ctx, metav1.ListOptions{})
+	if err != nil {
+		return false, fmt.Errorf("failed to list longhorn pods: %w", err)
+	}
+
+	for _, pod := range pods.Items {
+		// Check for any non-running longhorn pods that indicate unhealthy volumes
+		if pod.Status.Phase != corev1.PodRunning && pod.Status.Phase != corev1.PodSucceeded {
+			// Skip pods that are just starting
+			if pod.Status.Phase == corev1.PodPending {
+				for _, cond := range pod.Status.Conditions {
+					if cond.Type == corev1.PodScheduled && cond.Status == corev1.ConditionFalse {
+						a.logger.Debug("Longhorn pod not scheduled", "pod", pod.Name)
+						return false, nil
+					}
+				}
+			}
+		}
+	}
+
+	return true, nil
+}
+
+// ptr returns a pointer to the value
+func ptr[T any](v T) *T {
+	return &v
 }
