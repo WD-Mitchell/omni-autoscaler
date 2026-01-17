@@ -52,6 +52,10 @@ type Config struct {
 	// IgnoredNamespaces lists namespaces to ignore when counting pending pods
 	// This prevents feedback loops from system pods on new nodes
 	IgnoredNamespaces []string `json:"ignoredNamespaces"`
+	// DisableDuringUpgrades pauses autoscaling when Talos or Kubernetes upgrades are in progress
+	// This prevents scaling operations from interfering with cluster upgrades
+	// Default: true (recommended to prevent autoscaler from blocking upgrades)
+	DisableDuringUpgrades bool `json:"disableDuringUpgrades"`
 }
 
 // MachineSetConfig defines scaling parameters for a single machine set
@@ -117,6 +121,11 @@ func LoadFromFile(path string) (*Config, error) {
 			"kube-node-lease",
 			"flux-system",
 		}
+	}
+	// Default to pausing autoscaling during upgrades to prevent interference
+	// This must be explicitly set to false in config to disable this safety feature
+	if !cfg.DisableDuringUpgrades {
+		cfg.DisableDuringUpgrades = true
 	}
 
 	// Set defaults for machine set configs

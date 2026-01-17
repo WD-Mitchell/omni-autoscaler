@@ -72,7 +72,20 @@ func (a *Autoscaler) Run(ctx context.Context) error {
 
 // reconcile performs a single reconciliation cycle
 func (a *Autoscaler) reconcile(ctx context.Context) error {
-	a.logger.Debug("Starting reconciliation")
+	a.logger.Info("Starting reconciliation cycle")
+
+	// Check if upgrades are in progress and we should pause scaling
+	if a.config.DisableDuringUpgrades {
+		upgradeInProgress, upgradeType, err := a.omniClient.IsUpgradeInProgress(ctx)
+		if err != nil {
+			a.logger.Warn("Failed to check upgrade status", "error", err)
+			// Continue with scaling on error to avoid blocking autoscaling completely
+		} else if upgradeInProgress {
+			a.logger.Info("Cluster upgrade in progress, skipping autoscaling to prevent interference",
+				"upgrade_type", upgradeType)
+			return nil
+		}
+	}
 
 	// Get pending pods
 	pendingPods, err := a.getPendingPods(ctx)
@@ -80,7 +93,7 @@ func (a *Autoscaler) reconcile(ctx context.Context) error {
 		return fmt.Errorf("failed to get pending pods: %w", err)
 	}
 
-	// Get cluster resources (detailed CPU/memory info)
+	// Get cluster resource usage
 	resources, err := a.getClusterResources(ctx)
 	if err != nil {
 		return fmt.Errorf("failed to get cluster resources: %w", err)
@@ -93,7 +106,7 @@ func (a *Autoscaler) reconcile(ctx context.Context) error {
 		"pendingPods", len(pendingPods),
 	)
 
-	// Check each configured machine set
+	// Reconcile each configured machine set
 	for _, msConfig := range a.config.MachineSets {
 		if err := a.reconcileMachineSet(ctx, msConfig, pendingPods, resources); err != nil {
 			a.logger.Error("Failed to reconcile machine set", "machineSet", msConfig.Name, "error", err)

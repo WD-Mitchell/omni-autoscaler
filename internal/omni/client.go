@@ -163,3 +163,81 @@ func (c *Client) ListMachineSets(ctx context.Context) ([]*MachineSetStatus, erro
 
 	return result, nil
 }
+
+// IsTalosUpgradeInProgress checks if a Talos upgrade is currently in progress
+func (c *Client) IsTalosUpgradeInProgress(ctx context.Context) (bool, error) {
+	st := c.client.Omni().State()
+
+	// Get TalosUpgradeStatus for the cluster
+	upgradeStatus, err := safe.StateGet[*omni.TalosUpgradeStatus](
+		ctx,
+		st,
+		omni.NewTalosUpgradeStatus(resources.DefaultNamespace, c.clusterName).Metadata(),
+	)
+	if err != nil {
+		// If the resource doesn't exist, no upgrade is in progress
+		if state.IsNotFoundError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to get Talos upgrade status: %w", err)
+	}
+
+	spec := upgradeStatus.TypedSpec().Value
+	// Phase > 0 means upgrade has started
+	// We consider upgrade in progress if phase is set (not 0)
+	// The upgrade is complete when the status shows all machines upgraded
+	if spec.Phase > 0 && spec.Error == "" {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// IsKubernetesUpgradeInProgress checks if a Kubernetes upgrade is currently in progress
+func (c *Client) IsKubernetesUpgradeInProgress(ctx context.Context) (bool, error) {
+	st := c.client.Omni().State()
+
+	// Get KubernetesUpgradeStatus for the cluster
+	upgradeStatus, err := safe.StateGet[*omni.KubernetesUpgradeStatus](
+		ctx,
+		st,
+		omni.NewKubernetesUpgradeStatus(resources.DefaultNamespace, c.clusterName).Metadata(),
+	)
+	if err != nil {
+		// If the resource doesn't exist, no upgrade is in progress
+		if state.IsNotFoundError(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("failed to get Kubernetes upgrade status: %w", err)
+	}
+
+	spec := upgradeStatus.TypedSpec().Value
+	// Similar to Talos, check if upgrade is in progress
+	// Phase > 0 and no error means upgrade is actively running
+	if spec.Phase > 0 && spec.Error == "" {
+		return true, nil
+	}
+
+	return false, nil
+}
+
+// IsUpgradeInProgress checks if any upgrade (Talos or Kubernetes) is in progress
+func (c *Client) IsUpgradeInProgress(ctx context.Context) (bool, string, error) {
+	talosUpgrade, err := c.IsTalosUpgradeInProgress(ctx)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to check Talos upgrade status: %w", err)
+	}
+	if talosUpgrade {
+		return true, "Talos", nil
+	}
+
+	k8sUpgrade, err := c.IsKubernetesUpgradeInProgress(ctx)
+	if err != nil {
+		return false, "", fmt.Errorf("failed to check Kubernetes upgrade status: %w", err)
+	}
+	if k8sUpgrade {
+		return true, "Kubernetes", nil
+	}
+
+	return false, "", nil
+}
